@@ -1,0 +1,26 @@
+services:
+  scheduler:
+    build: .
+    image: render-farm-scheduler:latest
+    container_name: render-farm-scheduler
+    ports:
+      - "${SCHEDULER_PORT:-8000}:8000"
+    environment:
+      SCHEDULER_DB_PATH: /data/scheduler.db
+      SCHEDULER_TICK_SECONDS: "1.0"
+    volumes:
+      - scheduler-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  scheduler-data:
