@@ -2,7 +2,10 @@
 
 A small FastAPI + SQLite scheduling API for a render farm. Queued jobs get
 backfilled into CPU slots that are temporarily idle, while the queue head's
-earliest start time is preserved.
+earliest start time is preserved. Operators can also reserve **maintenance
+windows** (e.g. before swapping a node's disk): overlapping leases block the
+reservation, the node stops dispatching while work is underway, and
+scheduling resumes automatically afterwards.
 
 Interactive API docs: **http://localhost:8000/docs**
 
@@ -55,6 +58,9 @@ pytest -q
   returned early, otherwise it expires automatically.
 * **Queue** — jobs are ordered by submission (`seq`). Jobs that cannot start
   stay `queued`; they do not block jobs that fit except as described below.
+* **MaintenanceWindow** — one unended row per node with `starts_at` /
+  `ends_at`. Overlapping running leases block creation/rescheduling; while a
+  window is unended the node cannot take a lease that intersects it.
 
 ### Scheduling policy
 
@@ -81,6 +87,40 @@ Notes:
 * Node capacity can be changed at any time, but not below the slots currently
   leased on that node (`409`).
 
+### Maintenance windows
+
+A maintenance window reserves one whole node for a future interval (disk
+swap, hardware work). The rules:
+
+* Each node has **at most one unended window**. `PUT
+  /nodes/{node_id}/maintenance` creates the window; calling it again before
+  the start **reschedules** it (returns `200` instead of `201`). A window
+  that has started can no longer be changed or cancelled (`409`).
+* When the proposed window overlaps an **active lease**, the request fails
+  with `409` and the body lists every blocking `job_id`; the transaction
+  rolls back, so any existing reservation is preserved byte-for-byte. A
+  lease expiring exactly at the window start does not overlap (half-open
+  intervals touching at a point are allowed) — the latest a new lease may
+  finish before a window is precisely at its start.
+* Windows and leases check each other under the same `BEGIN IMMEDIATE`
+  serialisation: whichever commits first constrains the other. A lease
+  dispatched first participates in the next reservation check; a window
+  reserved first forbids any dispatch that would overlap it, including
+  backfills.
+* From the window start until its end the node **dispatches nothing**; once
+  it ends, the normal scheduling pass picks queued jobs again automatically
+  (no manual re-enable).
+* Head estimates and backfill both account for windows: a lease that cannot
+  finish before an upcoming window is treated as starting only after the
+  window end, and `blocked_reason` becomes `maintenance_window` when the
+  window (rather than slot contention) is the operative blocker. The head's
+  earliest start is still protected — a backfill can never push it later.
+* Windows live in SQLite, so they survive process restarts and keep
+  constraining dispatch afterwards. Ended windows remain in the history
+  listing but no longer affect scheduling.
+* SQL triggers independently reject any running lease whose
+  `[started_at, expires_at)` intersects an unended window.
+
 ### Concurrency and failure handling
 
 * In-process: every read-modify-write goes through a process-wide `RLock`.
@@ -99,6 +139,12 @@ Notes:
   failure cannot undo a successful release.
 * Duplicate `job_id` submissions return `409`; the unique constraint is the
   final arbiter under concurrent submissions.
+* Maintenance reservations run in the same `BEGIN IMMEDIATE` transactions as
+  dispatch passes, so a reservation and a lease allocation can never commit
+  overlapping intervals: the first to commit constrains the other. A failed
+  reservation rolls back entirely, leaving the prior window untouched.
+  SQLite triggers reject any lease row intersecting an unended window as a
+  final safety net.
 
 ---
 
@@ -109,6 +155,10 @@ Notes:
 | `POST` | `/nodes` | Create or update a node's slot capacity |
 | `GET` | `/nodes` | List nodes with used/free slots |
 | `GET` | `/nodes/{node_id}` | One node's capacity and usage |
+| `PUT` | `/nodes/{node_id}/maintenance` | Reserve/reschedule the node's maintenance window |
+| `GET` | `/nodes/{node_id}/maintenance` | The node's current unended window |
+| `DELETE` | `/nodes/{node_id}/maintenance` | Cancel an upcoming window |
+| `GET` | `/maintenance-windows?status=` | List windows (newest first) |
 | `POST` | `/jobs` | Submit a job (dispatches immediately if possible) |
 | `GET` | `/jobs?status=` | List jobs in submission order |
 | `GET` | `/jobs/{job_id}` | Status, assigned node, lease expiry, remaining time |
@@ -168,8 +218,32 @@ curl -s localhost:8000/jobs/plate-002   # status: running, node: farm-1
 ```
 
 `blocked_reason` is one of `waiting_for_free_slots`,
-`insufficient_capacity` (no node is large enough), or
+`maintenance_window` (a window delays the head more than slot contention
+does), `insufficient_capacity` (no node is large enough), or
 `no_nodes_configured`; it is `null` when the head is not blocked.
+
+### Maintenance walkthrough
+
+```bash
+# A window overlapping a running lease is rejected; the blockers are named.
+curl -s -X PUT localhost:8000/nodes/farm-1/maintenance \
+  -H 'content-type: application/json' \
+  -d '{"starts_at":"2026-11-21T10:00:00Z","ends_at":"2026-11-21T10:30:00Z"}'
+# 409 -> {"detail": "...", "blocking_jobs": ["plate-001"], "window": {...}}
+
+# Timestamps must carry an explicit timezone; a window after all current
+# leases is accepted (201 on create, 200 when rescheduling the existing one).
+curl -s -X PUT localhost:8000/nodes/farm-1/maintenance \
+  -H 'content-type: application/json' \
+  -d '{"starts_at":"2026-11-21T12:00:00Z","ends_at":"2026-11-21T12:30:00Z"}'
+
+# While the window is upcoming, only leases that end by 12:00 are dispatched
+# onto farm-1. Between 12:00 and 12:30 the node dispatches nothing; at 12:30
+# queued jobs start automatically. Inspect or cancel before start:
+curl -s localhost:8000/nodes/farm-1/maintenance
+curl -s -X DELETE localhost:8000/nodes/farm-1/maintenance
+curl -s 'localhost:8000/maintenance-windows?status=upcoming'
+```
 
 ---
 
@@ -177,10 +251,12 @@ curl -s localhost:8000/jobs/plate-002   # status: running, node: farm-1
 
 ```
 app/db.py          SQLite schema, transactions, invariant triggers
-app/scheduler.py   FIFO + backfill policy, leases, expiry, head estimate
+app/scheduler.py   FIFO + backfill policy, leases, expiry, head estimate,
+                   maintenance windows
 app/models.py      Pydantic request/response models (drives /docs)
 app/main.py        FastAPI routes, error mapping, background reaper
-tests/             38 tests: policy, leases, rollback, concurrency, HTTP, SQL
+tests/             77 tests: policy, leases, rollback, concurrency, HTTP,
+                   SQL invariants, maintenance windows
 Dockerfile         production image (non-root, healthcheck)
 Dockerfile.test    image that runs pytest
 docker-compose.yml single service + named volume for the SQLite file

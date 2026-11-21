@@ -43,6 +43,21 @@ CREATE TABLE IF NOT EXISTS jobs (
     )
 );
 
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    window_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id       TEXT NOT NULL REFERENCES nodes(node_id),
+    starts_at_us  INTEGER NOT NULL,
+    ends_at_us    INTEGER NOT NULL,
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    CHECK (ends_at_us > starts_at_us)
+);
+
+CREATE INDEX IF NOT EXISTS idx_windows_node_start
+    ON maintenance_windows (node_id, starts_at_us);
+CREATE INDEX IF NOT EXISTS idx_windows_end
+    ON maintenance_windows (ends_at_us);
+
 CREATE INDEX IF NOT EXISTS idx_jobs_status_seq
     ON jobs (status, seq);
 CREATE INDEX IF NOT EXISTS idx_jobs_node_status
@@ -93,6 +108,36 @@ WHEN NEW.capacity < (
 )
 BEGIN
     SELECT RAISE(ABORT, 'node capacity below current usage');
+END;
+
+-- Defence in depth for maintenance windows: a running lease must not be
+-- booked across (or inside) an unended window.  A lease that expires exactly
+-- when the window starts is legal (half-open intervals touching at a point do
+-- not overlap), matching the scheduler's own check.
+CREATE TRIGGER IF NOT EXISTS jobs_no_lease_over_window_insert
+BEFORE INSERT ON jobs
+WHEN NEW.status = 'running' AND NEW.assigned_node IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'lease overlaps a maintenance window')
+    WHERE EXISTS (
+        SELECT 1 FROM maintenance_windows w
+        WHERE w.node_id = NEW.assigned_node
+          AND w.starts_at_us < NEW.expires_at_us
+          AND w.ends_at_us > NEW.started_at_us
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS jobs_no_lease_over_window_update
+BEFORE UPDATE OF status, assigned_node, started_at_us, expires_at_us ON jobs
+WHEN NEW.status = 'running' AND NEW.assigned_node IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'lease overlaps a maintenance window')
+    WHERE EXISTS (
+        SELECT 1 FROM maintenance_windows w
+        WHERE w.node_id = NEW.assigned_node
+          AND w.starts_at_us < NEW.expires_at_us
+          AND w.ends_at_us > NEW.started_at_us
+    );
 END;
 """
 

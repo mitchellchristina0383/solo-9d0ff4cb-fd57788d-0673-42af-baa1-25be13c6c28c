@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 STATUS_LITERAL = Literal["queued", "running", "completed", "expired"]
 
@@ -13,6 +14,9 @@ STATUS_LITERAL = Literal["queued", "running", "completed", "expired"]
 IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 
 MAX_DURATION_SECONDS = 365 * 24 * 60 * 60
+
+# Maintenance windows are meant for planned work, not multi-year blackouts.
+MAX_WINDOW_SECONDS = 90 * 24 * 60 * 60
 
 
 class NodeConfigRequest(BaseModel):
@@ -57,7 +61,10 @@ class HeadEstimate(BaseModel):
     earliest_start_at: str | None
     earliest_start_in_seconds: float | None
     blocked_reason: Literal[
-        "waiting_for_free_slots", "insufficient_capacity", "no_nodes_configured"
+        "waiting_for_free_slots",
+        "maintenance_window",
+        "insufficient_capacity",
+        "no_nodes_configured",
     ] | None
 
 
@@ -80,3 +87,42 @@ class TickResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+class MaintenanceReservationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    starts_at: datetime = Field(
+        description="Window start (UTC). Must be strictly in the future."
+    )
+    ends_at: datetime = Field(
+        description="Window end (UTC). Must be later than starts_at."
+    )
+
+    @field_validator("starts_at", "ends_at")
+    @classmethod
+    def _require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "timestamp must include an explicit timezone offset, "
+                "e.g. '2026-11-21T10:00:00Z'"
+            )
+        return value
+
+
+class MaintenanceWindowView(BaseModel):
+    window_id: int
+    node_id: str
+    status: Literal["upcoming", "active", "ended"]
+    starts_at: str
+    ends_at: str
+    starts_in_seconds: float | None
+    ends_in_seconds: float | None
+    created_at: str
+    updated_at: str
+
+
+class MaintenanceConflictResponse(BaseModel):
+    detail: str
+    blocking_jobs: list[str]
+    window: MaintenanceWindowView | None = None

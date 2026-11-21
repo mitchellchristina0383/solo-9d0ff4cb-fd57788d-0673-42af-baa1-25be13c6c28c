@@ -64,6 +64,30 @@ class CapacityBelowUsageError(SchedulerError):
     status_code = 409
 
 
+class MaintenanceConflictError(SchedulerError):
+    """A proposed window overlaps running leases; carries the blockers."""
+
+    status_code = 409
+
+    def __init__(self, message: str, blocking_jobs: list[str]):
+        super().__init__(message)
+        self.blocking_jobs = blocking_jobs
+
+
+class MaintenanceValidationError(SchedulerError):
+    """Bad window bounds (past start, end before start, too long)."""
+
+    status_code = 422
+
+
+class MaintenanceNotFoundError(SchedulerError):
+    status_code = 404
+
+
+class MaintenanceInProgressError(SchedulerError):
+    status_code = 409
+
+
 # ---------------------------------------------------------------------------
 # Internal records
 # ---------------------------------------------------------------------------
@@ -81,6 +105,16 @@ class JobRecord:
     started_at_us: int | None
     expires_at_us: int | None
     ended_at_us: int | None
+
+
+@dataclass(frozen=True)
+class WindowRecord:
+    window_id: int
+    node_id: str
+    starts_at_us: int
+    ends_at_us: int
+    created_at_us: int
+    updated_at_us: int
 
 
 def to_iso(timestamp_us: int | None) -> str | None:
@@ -103,6 +137,17 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         started_at_us=row["started_at_us"],
         expires_at_us=row["expires_at_us"],
         ended_at_us=row["ended_at_us"],
+    )
+
+
+def _row_to_window(row: sqlite3.Row) -> WindowRecord:
+    return WindowRecord(
+        window_id=row["window_id"],
+        node_id=row["node_id"],
+        starts_at_us=row["starts_at_us"],
+        ends_at_us=row["ends_at_us"],
+        created_at_us=row["created_at_us"],
+        updated_at_us=row["updated_at_us"],
     )
 
 
@@ -238,6 +283,209 @@ class Scheduler:
     def tick(self) -> list[dict]:
         """Expire due leases and dispatch everything currently eligible."""
         return self._try_schedule()
+
+    # -- maintenance windows ---------------------------------------------
+
+    def reserve_maintenance(
+        self, node_id: str, starts_at_us: int, ends_at_us: int
+    ) -> tuple[dict, bool]:
+        """Create or reschedule the node's single unended maintenance window.
+
+        Returns ``(window_view, created)``.  On a lease overlap the whole
+        transaction rolls back, so any pre-existing reservation is preserved
+        untouched.
+        """
+        now = self.now_us()
+        if starts_at_us <= now:
+            raise MaintenanceValidationError(
+                "starts_at must be strictly in the future"
+            )
+        if ends_at_us <= starts_at_us:
+            raise MaintenanceValidationError("ends_at must be later than starts_at")
+        if (ends_at_us - starts_at_us) > 90 * 24 * 3600 * US_PER_SECOND:
+            raise MaintenanceValidationError(
+                "a maintenance window cannot be longer than 90 days"
+            )
+
+        with self._lock:
+            with self.store.transaction() as conn:
+                node = conn.execute(
+                    "SELECT node_id FROM nodes WHERE node_id = ?", (node_id,)
+                ).fetchone()
+                if node is None:
+                    raise NodeNotFoundError(f"node {node_id!r} not found")
+
+                # Only genuinely active leases count; sweep expiries first.
+                self._expire_due(conn, now, events=[])
+
+                existing_rows = conn.execute(
+                    """
+                    SELECT * FROM maintenance_windows
+                    WHERE node_id = ? AND ends_at_us > ?
+                    ORDER BY starts_at_us
+                    """,
+                    (node_id, now),
+                ).fetchall()
+                if len(existing_rows) > 1:  # pragma: no cover - invariant guard
+                    raise RuntimeError(
+                        f"node {node_id!r} has multiple unended windows"
+                    )
+                existing = _row_to_window(existing_rows[0]) if existing_rows else None
+                if existing is not None and existing.starts_at_us <= now:
+                    raise MaintenanceInProgressError(
+                        f"maintenance on node {node_id!r} has already started; "
+                        "the active window cannot be rescheduled"
+                    )
+
+                blockers = [
+                    row["job_id"]
+                    for row in conn.execute(
+                        """
+                        SELECT job_id FROM jobs
+                        WHERE status = 'running'
+                          AND assigned_node = ?
+                          AND started_at_us < ?
+                          AND expires_at_us > ?
+                        ORDER BY seq
+                        """,
+                        (node_id, ends_at_us, starts_at_us),
+                    ).fetchall()
+                ]
+                if blockers:
+                    # Raising rolls the transaction back: the original
+                    # reservation (if any) is kept exactly as it was.
+                    raise MaintenanceConflictError(
+                        "the proposed maintenance window overlaps active "
+                        f"leases on node {node_id!r}",
+                        blocking_jobs=blockers,
+                    )
+
+                if existing is None:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO maintenance_windows
+                            (node_id, starts_at_us, ends_at_us,
+                             created_at_us, updated_at_us)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (node_id, starts_at_us, ends_at_us, now, now),
+                    )
+                    window_id = cursor.lastrowid
+                    created = True
+                else:
+                    conn.execute(
+                        """
+                        UPDATE maintenance_windows
+                        SET starts_at_us = ?, ends_at_us = ?, updated_at_us = ?
+                        WHERE window_id = ?
+                        """,
+                        (starts_at_us, ends_at_us, now, existing.window_id),
+                    )
+                    window_id = existing.window_id
+                    created = False
+
+            # The window constrains dispatch immediately; re-run the pass so
+            # queued jobs that now fail the window rule are reconsidered.
+            self._try_schedule()
+            return self.get_maintenance_window(node_id), created
+
+    def cancel_maintenance(self, node_id: str) -> dict:
+        """Delete the node's upcoming window; active windows cannot be undone."""
+        now = self.now_us()
+        with self._lock:
+            with self.store.transaction() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM maintenance_windows
+                    WHERE node_id = ? AND ends_at_us > ?
+                    ORDER BY starts_at_us
+                    """,
+                    (node_id, now),
+                ).fetchall()
+                if not rows:
+                    raise MaintenanceNotFoundError(
+                        f"node {node_id!r} has no unended maintenance window"
+                    )
+                window = _row_to_window(rows[0])
+                if window.starts_at_us <= now:
+                    raise MaintenanceInProgressError(
+                        f"maintenance on node {node_id!r} is in progress and "
+                        "cannot be cancelled"
+                    )
+                conn.execute(
+                    "DELETE FROM maintenance_windows WHERE window_id = ?",
+                    (window.window_id,),
+                )
+                view = self._window_dict(window, now)
+            self._try_schedule()
+            return view
+
+    def get_maintenance_window(self, node_id: str) -> dict:
+        with self._lock:
+            self._try_schedule()
+            now = self.now_us()
+            with self.store.transaction() as conn:
+                node = conn.execute(
+                    "SELECT node_id FROM nodes WHERE node_id = ?", (node_id,)
+                ).fetchone()
+                if node is None:
+                    raise NodeNotFoundError(f"node {node_id!r} not found")
+                grouped = self._windows_in_tx(conn, now, node_id)
+                windows = grouped.get(node_id, [])
+                if not windows:
+                    raise MaintenanceNotFoundError(
+                        f"node {node_id!r} has no unended maintenance window"
+                    )
+                return self._window_dict(windows[0], now)
+
+    def list_maintenance_windows(
+        self, status_filter: str | None = None, limit: int = 200
+    ) -> list[dict]:
+        with self._lock:
+            self._try_schedule()
+            now = self.now_us()
+            with self.store.transaction() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM maintenance_windows
+                    ORDER BY starts_at_us DESC, window_id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+                views = [self._window_dict(_row_to_window(row), now) for row in rows]
+                if status_filter:
+                    views = [v for v in views if v["status"] == status_filter]
+                return views
+
+    def _window_dict(self, window: WindowRecord, now_us: int) -> dict:
+        if now_us < window.starts_at_us:
+            status = "upcoming"
+        elif now_us < window.ends_at_us:
+            status = "active"
+        else:
+            status = "ended"
+        return {
+            "window_id": window.window_id,
+            "node_id": window.node_id,
+            "status": status,
+            "starts_at": to_iso(window.starts_at_us),
+            "ends_at": to_iso(window.ends_at_us),
+            "starts_in_seconds": (
+                None
+                if status == "ended"
+                else max(0.0, (window.starts_at_us - now_us) / US_PER_SECOND)
+            ),
+            "ends_in_seconds": (
+                None
+                if status == "ended"
+                else max(0.0, (window.ends_at_us - now_us) / US_PER_SECOND)
+            ),
+            "created_at": to_iso(window.created_at_us),
+            "updated_at": to_iso(window.updated_at_us),
+        }
+
+    # -- node / job reads -------------------------------------------------
 
     def get_node(self, node_id: str) -> dict:
         with self._lock:
@@ -391,12 +639,14 @@ class Scheduler:
             ).fetchall()
         ]
 
+        windows_by_node = self._windows_in_tx(conn, now_us)
+
         while queued:
             head = queued[0]
             head_start = self._earliest_start_us(
-                head, capacities, running_by_node, now_us
+                head, capacities, running_by_node, windows_by_node, now_us
             )
-            node_id = self._best_fit_node(head, available)
+            node_id = self._best_fit_node(head, available, windows_by_node, now_us)
             if node_id is not None:
                 self._allocate(
                     conn,
@@ -416,7 +666,9 @@ class Scheduler:
                 # fit right now use otherwise idle slots.  The head keeps
                 # queue position 1.
                 for candidate in list(queued[1:]):
-                    chosen = self._best_fit_node(candidate, available)
+                    chosen = self._best_fit_node(
+                        candidate, available, windows_by_node, now_us
+                    )
                     if chosen is not None:
                         self._allocate(
                             conn,
@@ -439,6 +691,7 @@ class Scheduler:
                     head_start,
                     capacities,
                     running_by_node,
+                    windows_by_node,
                     available,
                     now_us,
                 )
@@ -458,13 +711,40 @@ class Scheduler:
         return events
 
     @staticmethod
+    def _apply_windows(
+        candidate_us: int,
+        node_id: str,
+        windows_by_node: dict[str, list[WindowRecord]],
+    ) -> int:
+        """Push a prospective lease start past any overlapping window.
+
+        A node is fully unavailable during a maintenance window, so a start
+        that falls inside one is moved to the window end.  Windows are stored
+        ordered by start, which makes the loop stable even when one window
+        ends after the next one begins (they never overlap for one node in
+        practice, but the loop does not rely on that).
+        """
+        for window in windows_by_node.get(node_id, ()):  # ordered by start
+            if window.starts_at_us <= candidate_us < window.ends_at_us:
+                candidate_us = window.ends_at_us
+        return candidate_us
+
+    @classmethod
     def _earliest_start_us(
+        cls,
         job: JobRecord,
         capacities: dict[str, int],
         running_by_node: dict[str, list[JobRecord]],
+        windows_by_node: dict[str, list[WindowRecord]],
         now_us: int,
     ) -> int | None:
-        """Earliest time ``job`` could start if every lease runs to expiry."""
+        """Earliest time ``job`` could start if every lease runs to expiry.
+
+        Maintenance windows count as full-node blackouts: a prospective start
+        inside a window moves to that window's end, and a lease whose full
+        duration would cross a window start cannot start in the pre-window
+        gap (it is pushed to the window end).
+        """
         best: int | None = None
         for node_id, capacity in capacities.items():
             if capacity < job.required_slots:
@@ -475,44 +755,88 @@ class Scheduler:
             )
             free = capacity - sum(r.required_slots for r in running)
             if free >= job.required_slots:
-                return now_us
+                # Slots are free now, but the whole lease must fit before an
+                # upcoming window; otherwise the node is only usable after it.
+                candidate = cls._apply_windows(now_us, node_id, windows_by_node)
+                if candidate == now_us:
+                    for window in windows_by_node.get(node_id, ()):
+                        if (
+                            window.starts_at_us > now_us
+                            and now_us + job.max_duration_us > window.starts_at_us
+                        ):
+                            candidate = max(candidate, window.ends_at_us)
+                            break
+                if best is None or candidate < best:
+                    best = candidate
+                continue
+
             need = job.required_slots - free
             freed = 0
             for running_job in running:
                 freed += running_job.required_slots
                 if freed >= need:
                     candidate = max(running_job.expires_at_us or now_us, now_us)
+                    candidate = cls._apply_windows(
+                        candidate, node_id, windows_by_node
+                    )
                     if best is None or candidate < best:
                         best = candidate
                     break
         return best
 
-    @staticmethod
-    def _best_fit_node(job: JobRecord, available: dict[str, int]) -> str | None:
-        candidates = [
-            (free - job.required_slots, node_id)
-            for node_id, free in available.items()
-            if free >= job.required_slots
-        ]
+    @classmethod
+    def _best_fit_node(
+        cls,
+        job: JobRecord,
+        available: dict[str, int],
+        windows_by_node: dict[str, list[WindowRecord]] | None = None,
+        now_us: int | None = None,
+    ) -> str | None:
+        """Smallest node that can host the job's whole lease right now."""
+        windows_by_node = windows_by_node or {}
+        now_us = now_us or 0
+        candidates = []
+        for node_id, free in available.items():
+            if free < job.required_slots:
+                continue
+            # A node inside a maintenance window is fully stopped, and a lease
+            # that would outlive an upcoming window start cannot be booked.
+            start = cls._apply_windows(now_us, node_id, windows_by_node)
+            if start != now_us:
+                continue
+            expires_at = now_us + job.max_duration_us
+            if any(
+                window.starts_at_us < expires_at and window.ends_at_us > now_us
+                for window in windows_by_node.get(node_id, ())
+            ):
+                continue
+            candidates.append((free - job.required_slots, node_id))
         if not candidates:
             return None
         return min(candidates)[1]
 
+    @classmethod
     def _backfill_node(
-        self,
+        cls,
         candidate: JobRecord,
         head: JobRecord,
         head_start_us: int,
         capacities: dict[str, int],
         running_by_node: dict[str, list[JobRecord]],
+        windows_by_node: dict[str, list[WindowRecord]],
         available: dict[str, int],
         now_us: int,
     ) -> str | None:
         """Pick a node for ``candidate`` that does not delay the head."""
+        # Reuse the same window-aware admission rule as a normal dispatch so
+        # a backfill can never be booked across a maintenance window.
         fits = sorted(
             (free - candidate.required_slots, node_id)
             for node_id, free in available.items()
-            if free >= candidate.required_slots
+            if cls._best_fit_node(
+                candidate, {node_id: free}, windows_by_node, now_us
+            )
+            is not None
         )
         for _slack, node_id in fits:
             trial = {n: list(jobs) for n, jobs in running_by_node.items()}
@@ -525,8 +849,8 @@ class Scheduler:
                     expires_at_us=now_us + candidate.max_duration_us,
                 )
             )
-            new_head_start = self._earliest_start_us(
-                head, capacities, trial, now_us
+            new_head_start = cls._earliest_start_us(
+                head, capacities, trial, windows_by_node, now_us
             )
             if new_head_start is not None and new_head_start <= head_start_us:
                 return node_id
@@ -592,6 +916,39 @@ class Scheduler:
         ).fetchall()
         return {row["job_id"]: index for index, row in enumerate(rows, start=1)}
 
+    @staticmethod
+    def _windows_in_tx(
+        conn: sqlite3.Connection, now_us: int, node_id: str | None = None
+    ) -> dict[str, list[WindowRecord]]:
+        """Unended windows (end strictly after now), grouped per node.
+
+        Ended windows stay in the table for history/restart durability but no
+        longer influence scheduling.
+        """
+        if node_id is None:
+            rows = conn.execute(
+                """
+                SELECT * FROM maintenance_windows
+                WHERE ends_at_us > ?
+                ORDER BY node_id, starts_at_us
+                """,
+                (now_us,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM maintenance_windows
+                WHERE node_id = ? AND ends_at_us > ?
+                ORDER BY starts_at_us
+                """,
+                (node_id, now_us),
+            ).fetchall()
+        grouped: dict[str, list[WindowRecord]] = {}
+        for row in rows:
+            window = _row_to_window(row)
+            grouped.setdefault(window.node_id, []).append(window)
+        return grouped
+
     def _head_estimate_in_tx(self, conn: sqlite3.Connection, now_us: int) -> dict:
         row = conn.execute(
             "SELECT * FROM jobs WHERE status = 'queued' ORDER BY seq LIMIT 1"
@@ -616,16 +973,26 @@ class Scheduler:
             job = _row_to_job(running_row)
             if job.assigned_node:
                 running_by_node.setdefault(job.assigned_node, []).append(job)
+        windows_by_node = self._windows_in_tx(conn, now_us)
 
         earliest = self._earliest_start_us(
-            head, capacities, running_by_node, now_us
+            head, capacities, running_by_node, windows_by_node, now_us
+        )
+        lease_only = self._earliest_start_us(
+            head, capacities, running_by_node, {}, now_us
         )
         if earliest is None:
             reason = (
                 "no_nodes_configured" if not capacities else "insufficient_capacity"
             )
         elif earliest > now_us:
-            reason = "waiting_for_free_slots"
+            # A window is the operative blocker when ignoring windows would
+            # let the head start now (or earlier than the window-aware ETA).
+            reason = (
+                "maintenance_window"
+                if lease_only is not None and lease_only < earliest
+                else "waiting_for_free_slots"
+            )
         else:
             reason = None
 

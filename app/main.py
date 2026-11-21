@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import timezone
 from typing import Literal
 
 from fastapi import FastAPI, Query, Request, status
@@ -18,13 +19,21 @@ from .models import (
     HeadEstimate,
     JobSubmitRequest,
     JobView,
+    MaintenanceConflictResponse,
+    MaintenanceReservationRequest,
+    MaintenanceWindowView,
     NodeConfigRequest,
     NodeView,
     QueueView,
     SchedulerEvent,
     TickResponse,
 )
-from .scheduler import Scheduler, SchedulerError
+from .scheduler import (
+    MaintenanceConflictError,
+    Scheduler,
+    SchedulerError,
+    US_PER_SECOND,
+)
 
 logger = logging.getLogger("render_scheduler")
 
@@ -87,11 +96,14 @@ def create_app(
 
     app = FastAPI(
         title="Render Farm Slot Scheduler",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "Backfills idle CPU slots for queued render jobs while preserving "
             "queue order. Every job leases all of its slots on one node; "
-            "leases are returned explicitly or expire automatically."
+            "leases are returned explicitly or expire automatically. "
+            "Maintenance windows reserve a node for disk swaps and similar "
+            "work: no lease may overlap a window, the node stops dispatching "
+            "during it, and scheduling resumes automatically once it ends."
         ),
         lifespan=lifespan,
     )
@@ -145,6 +157,94 @@ def create_app(
     )
     def get_node(node_id: str) -> NodeView:
         return NodeView(**scheduler.get_node(node_id))
+
+    # -- maintenance windows --------------------------------------------
+
+    def _to_microseconds(value) -> int:
+        return int(round(value.astimezone(timezone.utc).timestamp() * US_PER_SECOND))
+
+    @app.put(
+        "/nodes/{node_id}/maintenance",
+        response_model=MaintenanceWindowView,
+        tags=["maintenance"],
+        summary="Reserve (or reschedule before start) a maintenance window",
+        responses={
+            200: {"model": MaintenanceWindowView, "description": "Existing window rescheduled"},
+            201: {"model": MaintenanceWindowView, "description": "Window created"},
+            404: {"model": ErrorResponse},
+            409: {"model": MaintenanceConflictResponse},
+            422: {"model": ErrorResponse},
+        },
+    )
+    def reserve_maintenance(
+        node_id: str, payload: MaintenanceReservationRequest
+    ) -> JSONResponse:
+        try:
+            view, created = scheduler.reserve_maintenance(
+                node_id,
+                _to_microseconds(payload.starts_at),
+                _to_microseconds(payload.ends_at),
+            )
+        except MaintenanceConflictError as exc:
+            # Keep the caller's original reservation visible in the response.
+            current = None
+            try:
+                current = MaintenanceWindowView(
+                    **scheduler.get_maintenance_window(node_id)
+                )
+            except SchedulerError:
+                current = None
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=MaintenanceConflictResponse(
+                    detail=str(exc),
+                    blocking_jobs=exc.blocking_jobs,
+                    window=current,
+                ).model_dump(),
+            )
+        return JSONResponse(
+            status_code=201 if created else 200,
+            content=MaintenanceWindowView(**view).model_dump(),
+        )
+
+    @app.get(
+        "/nodes/{node_id}/maintenance",
+        response_model=MaintenanceWindowView,
+        tags=["maintenance"],
+        summary="Get the node's current (unended) maintenance window",
+        responses={404: {"model": ErrorResponse}},
+    )
+    def get_maintenance(node_id: str) -> MaintenanceWindowView:
+        return MaintenanceWindowView(**scheduler.get_maintenance_window(node_id))
+
+    @app.delete(
+        "/nodes/{node_id}/maintenance",
+        response_model=MaintenanceWindowView,
+        tags=["maintenance"],
+        summary="Cancel an upcoming maintenance window",
+        responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    )
+    def cancel_maintenance(node_id: str) -> MaintenanceWindowView:
+        return MaintenanceWindowView(**scheduler.cancel_maintenance(node_id))
+
+    @app.get(
+        "/maintenance-windows",
+        response_model=list[MaintenanceWindowView],
+        tags=["maintenance"],
+        summary="List maintenance windows (newest first)",
+    )
+    def list_maintenance(
+        status_filter: Literal["upcoming", "active", "ended"] | None = Query(
+            default=None, alias="status"
+        ),
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> list[MaintenanceWindowView]:
+        return [
+            MaintenanceWindowView(**window)
+            for window in scheduler.list_maintenance_windows(
+                status_filter=status_filter, limit=limit
+            )
+        ]
 
     # -- jobs -----------------------------------------------------------
 
